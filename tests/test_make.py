@@ -694,6 +694,216 @@ class TestAttributes:
 
         assert 12 == getattr(c, "z", None)
 
+    def test_pre_init_kw_only_default_signature(self):
+        """
+        The generated signature keeps a keyword-only field's default, and the
+        pre-init hook receives that default when the argument is omitted.
+        """
+
+        @attr.s
+        class C:
+            y = attr.field(kw_only=True, default=5)
+
+            def __attrs_pre_init__(self2, y):
+                self2.z = y
+
+        sig = inspect.signature(C)
+        params = list(sig.parameters.values())
+
+        assert 1 == len(params)
+        assert inspect.Parameter.KEYWORD_ONLY == params[0].kind
+        assert 5 == params[0].default
+
+        assert 5 == C().z
+        assert 9 == C(y=9).z
+
+    @pytest.mark.usefixtures("with_and_without_validation")
+    def test_pre_init_positional_default_passes_selected_value(self):
+        """
+        Positional fields with plain defaults forward the selected value --
+        the default when omitted, the caller's value otherwise -- rather than
+        always forwarding the default.
+        """
+
+        @attr.s
+        class C:
+            x = attr.field(default=5)
+
+            def __attrs_pre_init__(self2, x):
+                self2.z = x
+
+        assert 5 == C().z
+        assert 9 == C(9).z
+        assert 9 == C(x=9).z
+
+    @pytest.mark.usefixtures("with_and_without_validation")
+    def test_pre_init_factory_passes_selected_value(self):
+        """
+        Fields with factories forward the factory result when the argument is
+        omitted and the caller's value when it is supplied, for both
+        positional and keyword-only fields.
+        """
+        seen = []
+
+        @attr.s
+        class C:
+            x = attr.field(factory=lambda: 42)
+            y = attr.field(kw_only=True, factory=list)
+
+            def __attrs_pre_init__(self2, x, y):
+                seen.append((x, y))
+
+        inst = C()
+        assert (42, []) == seen[-1]
+        assert 42 == inst.x
+        assert [] == inst.y
+
+        # The factory result must be a fresh value per instance.
+        C()
+        assert seen[-1][1] is not seen[-2][1]
+
+        inst = C(8, y=[1, 2])
+        assert (8, [1, 2]) == seen[-1]
+        assert 8 == inst.x
+        assert [1, 2] == inst.y
+
+    @pytest.mark.usefixtures("with_and_without_validation")
+    def test_pre_init_takes_self_factory(self):
+        """
+        A takes_self factory can't be evaluated before the pre-init hook
+        (it relies on already-initialized attributes), so it keeps the
+        standard NOTHING sentinel and still initializes the field correctly.
+        """
+        seen = {}
+
+        @attr.s
+        class C:
+            n = attr.field(default=3)
+            xs = attr.field(
+                default=Factory(lambda self: [self.n], takes_self=True)
+            )
+
+            def __attrs_pre_init__(self2, n, xs):
+                seen["n"] = n
+                seen["xs"] = xs
+
+        inst = C()
+        assert 3 == seen["n"]
+        assert attr.NOTHING is seen["xs"]
+        assert [3] == inst.xs
+
+        assert [10] == C(10).xs
+
+    @pytest.mark.usefixtures("with_and_without_validation")
+    def test_pre_init_kw_only_defaults_and_factories(self):
+        """
+        A mixture of positional, defaulted, keyword-only and factory fields
+        forwards the selected values to __attrs_pre_init__ in every calling
+        convention, and inspect.signature reflects the generated __init__.
+        """
+
+        @attr.s
+        class C:
+            val1 = attr.field()
+            val2 = attr.field(default=100)
+            val3 = attr.field(factory=int)
+            val4 = attr.field(kw_only=True)
+            val5 = attr.field(default=100, kw_only=True)
+            val6 = attr.field(factory=int, kw_only=True)
+
+            # too many positional arguments is the point of the test
+            def __attrs_pre_init__(  # noqa: PLR0917
+                self2, val1, val2, val3, val4, val5, val6
+            ):
+                self2.seen = (val1, val2, val3, val4, val5, val6)
+
+        sig = inspect.signature(C)
+        assert (
+            "(val1, val2=100, val3=NOTHING, *, val4, val5=100, val6=NOTHING) -> None"
+            == str(sig)
+        )
+
+        inst = C(1, val4=4)
+        assert (1, 100, 0, 4, 100, 0) == inst.seen
+
+        inst = C(
+            val1=200,
+            val2=200,
+            val3=200,
+            val4=200,
+            val5=200,
+            val6=200,
+        )
+        assert (200,) * 6 == inst.seen
+
+        inst = C(1, 2, 3, val4=4, val5=5, val6=6)
+        assert (1, 2, 3, 4, 5, 6) == inst.seen
+
+    @pytest.mark.usefixtures("with_and_without_validation")
+    def test_pre_init_inherited_kw_only_alignment(self):
+        """
+        Keyword-only fields inherited from a base class don't get misaligned
+        with the positional fields of a subclass when forwarded to the
+        pre-init hook, regardless of whether defaults or factories apply.
+        """
+
+        @attr.s
+        class Base:
+            a = attr.field()
+            b = attr.field(kw_only=True, default="b-default")
+            c = attr.field(kw_only=True, factory=lambda: "c-factory")
+
+        @attr.s
+        class Child(Base):
+            d = attr.field(default="d-default")
+            e = attr.field(kw_only=True, default="e-default")
+
+            def __attrs_pre_init__(self2, a, d, b, c, e):
+                self2.seen = (a, d, b, c, e)
+
+        sig = inspect.signature(Child)
+        assert (
+            "(a, d='d-default', *, b='b-default', c=NOTHING, e='e-default') -> None"
+            == str(sig)
+        )
+
+        inst = Child(1)
+        assert (
+            1,
+            "d-default",
+            "b-default",
+            "c-factory",
+            "e-default",
+        ) == inst.seen
+
+        inst = Child(1, 2, b="B", c="C", e="E")
+        assert (1, 2, "B", "C", "E") == inst.seen
+
+    @pytest.mark.usefixtures("with_and_without_validation")
+    def test_pre_init_validators_consistency(self):
+        """
+        The values forwarded to the pre-init hook are the same with
+        validators enabled or disabled.
+        """
+
+        @attr.s
+        class C:
+            x = attr.field(
+                kw_only=True,
+                default=5,
+                validator=attr.validators.instance_of(int),
+            )
+            y = attr.field(
+                factory=lambda: 9,
+                validator=attr.validators.instance_of(int),
+            )
+
+            def __attrs_pre_init__(self2, x, y):
+                self2.seen = (x, y)
+
+        assert (5, 9) == C().seen
+        assert (1, 2) == C(x=1, y=2).seen
+
     @pytest.mark.usefixtures("with_and_without_validation")
     def test_post_init(self):
         """
