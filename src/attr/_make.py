@@ -2010,6 +2010,16 @@ def _attrs_to_init_script(
     kw_only_args = []
     attrs_to_validate = []
 
+    # The names of __init__'s parameters, used to call __attrs_pre_init__
+    # with the same values __init__ itself was called with:
+    # positional-or-keyword parameters are passed positionally and
+    # keyword-only parameters are passed by name.
+    pre_init_arg_names = []
+    pre_init_kw_only_arg_names = []
+    # Lines resolving factories before the pre-init call, so that the hook
+    # receives the final values instead of NOTHING.
+    pre_init_factory_lines = []
+
     # This is a dictionary of names to validator and converter callables.
     # Injecting this into __init__ globals lets us avoid lookups.
     names_for_globals = {}
@@ -2083,8 +2093,10 @@ def _attrs_to_init_script(
             arg = f"{arg_name}=attr_dict['{attr_name}'].default"
             if a.kw_only:
                 kw_only_args.append(arg)
+                pre_init_kw_only_arg_names.append(arg_name)
             else:
                 args.append(arg)
+                pre_init_arg_names.append(arg_name)
 
             if converter is not None:
                 lines.append(
@@ -2102,50 +2114,83 @@ def _attrs_to_init_script(
             arg = f"{arg_name}=NOTHING"
             if a.kw_only:
                 kw_only_args.append(arg)
+                pre_init_kw_only_arg_names.append(arg_name)
             else:
                 args.append(arg)
-            lines.append(f"if {arg_name} is not NOTHING:")
+                pre_init_arg_names.append(arg_name)
 
             init_factory_name = _INIT_FACTORY_PAT % (a.name,)
-            if converter is not None:
-                lines.append(
-                    "    "
-                    + fmt_setter_with_converter(
-                        attr_name, arg_name, has_on_setattr, converter
+
+            if (
+                call_pre_init
+                and pre_init_has_args
+                and not a.default.takes_self
+            ):
+                # Resolve the factory before __attrs_pre_init__ is called so
+                # that the hook receives the final value instead of NOTHING.
+                # Factories taking self can't be resolved early because no
+                # attributes are set at that point.
+                pre_init_factory_lines.append(f"if {arg_name} is NOTHING:")
+                pre_init_factory_lines.append(
+                    f"    {arg_name} = {init_factory_name}()"
+                )
+                if converter is not None:
+                    lines.append(
+                        fmt_setter_with_converter(
+                            attr_name, arg_name, has_on_setattr, converter
+                        )
                     )
-                )
-                lines.append("else:")
-                lines.append(
-                    "    "
-                    + fmt_setter_with_converter(
-                        attr_name,
-                        init_factory_name + "(" + maybe_self + ")",
-                        has_on_setattr,
-                        converter,
+                    names_for_globals[converter._get_global_name(a.name)] = (
+                        converter.converter
                     )
-                )
-                names_for_globals[converter._get_global_name(a.name)] = (
-                    converter.converter
-                )
+                else:
+                    lines.append(
+                        fmt_setter(attr_name, arg_name, has_on_setattr)
+                    )
             else:
-                lines.append(
-                    "    " + fmt_setter(attr_name, arg_name, has_on_setattr)
-                )
-                lines.append("else:")
-                lines.append(
-                    "    "
-                    + fmt_setter(
-                        attr_name,
-                        init_factory_name + "(" + maybe_self + ")",
-                        has_on_setattr,
+                lines.append(f"if {arg_name} is not NOTHING:")
+                if converter is not None:
+                    lines.append(
+                        "    "
+                        + fmt_setter_with_converter(
+                            attr_name, arg_name, has_on_setattr, converter
+                        )
                     )
-                )
+                    lines.append("else:")
+                    lines.append(
+                        "    "
+                        + fmt_setter_with_converter(
+                            attr_name,
+                            init_factory_name + "(" + maybe_self + ")",
+                            has_on_setattr,
+                            converter,
+                        )
+                    )
+                    names_for_globals[converter._get_global_name(a.name)] = (
+                        converter.converter
+                    )
+                else:
+                    lines.append(
+                        "    "
+                        + fmt_setter(attr_name, arg_name, has_on_setattr)
+                    )
+                    lines.append("else:")
+                    lines.append(
+                        "    "
+                        + fmt_setter(
+                            attr_name,
+                            init_factory_name + "(" + maybe_self + ")",
+                            has_on_setattr,
+                        )
+                    )
             names_for_globals[init_factory_name] = a.default.factory
         else:
             if a.kw_only:
                 kw_only_args.append(arg_name)
+                pre_init_kw_only_arg_names.append(arg_name)
             else:
                 args.append(arg_name)
+                pre_init_arg_names.append(arg_name)
 
             if converter is not None:
                 lines.append(
@@ -2202,21 +2247,20 @@ def _attrs_to_init_script(
         lines.append(f"BaseException.__init__(self, {vals})")
 
     args = ", ".join(args)
-    pre_init_args = args
     if kw_only_args:
         # leading comma & kw_only args
         args += f"{', ' if args else ''}*, {', '.join(kw_only_args)}"
-        pre_init_kw_only_args = ", ".join(
-            [f"{kw_arg}={kw_arg}" for kw_arg in kw_only_args]
-        )
-        pre_init_args += (
-            ", " if pre_init_args else ""
-        )  # handle only kwargs and no regular args
-        pre_init_args += pre_init_kw_only_args
 
     if call_pre_init and pre_init_has_args:
-        # If pre init method has arguments, pass same arguments as `__init__`
+        # If pre init method has arguments, pass the same values __init__
+        # was called with.
+        pre_init_args = ", ".join(
+            pre_init_arg_names
+            + [f"{name}={name}" for name in pre_init_kw_only_arg_names]
+        )
         lines[0] = f"self.__attrs_pre_init__({pre_init_args})"
+        # Factories must be resolved before the pre-init call.
+        lines[0:0] = pre_init_factory_lines
 
     # Python 3.7 doesn't allow backslashes in f strings.
     NL = "\n    "

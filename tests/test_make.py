@@ -29,6 +29,7 @@ from attr._make import (
     _Attributes,
     _ClassBuilder,
     _CountingAttr,
+    _attrs_to_init_script,
     _determine_attrib_eq_order,
     _determine_attrs_eq_order,
     _determine_whether_to_implement,
@@ -693,6 +694,266 @@ class TestAttributes:
         c = C(y=11)
 
         assert 12 == getattr(c, "z", None)
+
+    @pytest.mark.usefixtures("with_and_without_validation")
+    def test_pre_init_args_with_defaults(self):
+        """
+        __attrs_pre_init__ receives the values __init__ is called with:
+        explicitly passed values, or the defaults of positional and
+        keyword-only fields if they are omitted.
+        """
+
+        @attr.s
+        class C:
+            x = attr.ib(default=10)
+            y = attr.ib(kw_only=True, default=42)
+
+            def __attrs_pre_init__(self2, x, y):
+                self2.z = (x, y)
+
+        assert (10, 42) == C().z
+        assert (1, 42) == C(1).z
+        assert (1, 2) == C(1, y=2).z
+        assert (10, 2) == C(y=2).z
+
+    @pytest.mark.usefixtures("with_and_without_validation")
+    def test_pre_init_args_only_kw_only_defaults(self):
+        """
+        On classes with only keyword-only fields, __attrs_pre_init__
+        receives defaults and factory results, not NOTHING.
+        """
+
+        @attr.s
+        class C:
+            x = attr.ib(kw_only=True, default=10)
+            y = attr.ib(kw_only=True, factory=lambda: 20)
+
+            def __attrs_pre_init__(self2, x, y):
+                self2.z = (x, y)
+
+        assert (10, 20) == C().z
+        assert (1, 2) == C(x=1, y=2).z
+
+    @pytest.mark.usefixtures("with_and_without_validation")
+    def test_pre_init_args_factory(self):
+        """
+        __attrs_pre_init__ receives the factory's result -- the very object
+        the attribute is set to -- if no value is passed, and the passed
+        value otherwise.  Each factory is called exactly once.
+        """
+        factory_calls = []
+
+        def factory():
+            factory_calls.append(1)
+            return {}
+
+        @attr.s
+        class C:
+            x = attr.ib(factory=factory)
+            y = attr.ib(kw_only=True, factory=factory)
+
+            def __attrs_pre_init__(self2, x, y):
+                self2.z = (x, y)
+
+        c = C()
+
+        assert (c.x, c.y) == c.z
+        assert c.x is c.z[0]
+        assert c.y is c.z[1]
+        assert 2 == len(factory_calls)
+
+        c = C(1, y=2)
+
+        assert (1, 2) == c.z
+        assert 2 == len(factory_calls)
+
+    @pytest.mark.usefixtures("with_and_without_validation")
+    def test_pre_init_args_validated(self):
+        """
+        The values passed to __attrs_pre_init__ are the same whether
+        validators are enabled or not.
+        """
+
+        @attr.s
+        class C:
+            x = attr.ib(default=1, validator=attr.validators.instance_of(int))
+            y = attr.ib(
+                kw_only=True,
+                factory=lambda: 2,
+                validator=attr.validators.instance_of(int),
+            )
+
+            def __attrs_pre_init__(self2, x, y):
+                self2.z = (x, y)
+
+        assert (1, 2) == C().z
+        assert (3, 4) == C(3, y=4).z
+
+    def test_pre_init_args_signature(self):
+        """
+        The generated __init__ of a class whose __attrs_pre_init__ takes
+        arguments has a correct inspect.signature: defaults are kept and
+        keyword-only fields stay keyword-only.
+        """
+
+        @attr.s
+        class C:
+            x = attr.ib()
+            y = attr.ib(default=10)
+            z = attr.ib(kw_only=True, default=42)
+
+            def __attrs_pre_init__(self2, x, y, z):
+                pass
+
+        params = list(inspect.signature(C.__init__).parameters.values())
+
+        assert ["self", "x", "y", "z"] == [p.name for p in params]
+        assert inspect.Parameter.empty is params[1].default
+        assert 10 == params[2].default
+        assert 42 == params[3].default
+        assert inspect.Parameter.POSITIONAL_OR_KEYWORD is params[1].kind
+        assert inspect.Parameter.POSITIONAL_OR_KEYWORD is params[2].kind
+        assert inspect.Parameter.KEYWORD_ONLY is params[3].kind
+
+    @pytest.mark.usefixtures("with_and_without_validation")
+    def test_pre_init_args_inherited(self):
+        """
+        Inherited keyword-only fields with defaults are passed to
+        __attrs_pre_init__ under the right names, mixed with the subclass's
+        own positional and keyword-only fields.
+        """
+
+        @attr.s
+        class Base:
+            a = attr.ib(kw_only=True, default="a-default")
+            b = attr.ib(kw_only=True, factory=lambda: "b-factory")
+
+        @attr.s
+        class Sub(Base):
+            c = attr.ib()
+            d = attr.ib(kw_only=True, default="d-default")
+
+            def __attrs_pre_init__(self2, c, a, b, d):
+                self2.seen = (c, a, b, d)
+
+        s = Sub(1)
+
+        assert (1, "a-default", "b-factory", "d-default") == s.seen
+        assert ("a-default", "b-factory", "d-default") == (s.a, s.b, s.d)
+
+        s = Sub(1, a="A", b="B", d="D")
+
+        assert (1, "A", "B", "D") == s.seen
+        assert ("A", "B", "D") == (s.a, s.b, s.d)
+
+    @pytest.mark.usefixtures("with_and_without_validation")
+    def test_pre_init_args_inherited_hook(self):
+        """
+        A __attrs_pre_init__ inherited from a base class is called with the
+        subclass's full set of init arguments.
+        """
+
+        class Base:
+            def __attrs_pre_init__(self2, x, y):
+                self2.seen = (x, y)
+
+        @attr.s
+        class Sub(Base):
+            x = attr.ib(default=1)
+            y = attr.ib(kw_only=True, factory=lambda: 2)
+
+        assert (1, 2) == Sub().seen
+        assert (3, 4) == Sub(3, y=4).seen
+
+    @pytest.mark.usefixtures("with_and_without_validation")
+    def test_pre_init_args_takes_self_factory(self):
+        """
+        Factories taking self can't be resolved before __attrs_pre_init__
+        is called, so they keep receiving the partially initialized
+        instance.  Explicitly passed values are passed on to the hook.
+        """
+
+        @attr.s
+        class C:
+            x = attr.ib()
+            y = attr.ib(
+                default=Factory(lambda self: self.x * 2, takes_self=True)
+            )
+
+            def __attrs_pre_init__(self2, x, y):
+                self2.seen_x = x
+
+        c = C(5)
+
+        assert 10 == c.y
+        assert 5 == c.seen_x
+
+        c = C(5, y=100)
+
+        assert 100 == c.y
+        assert 5 == c.seen_x
+
+    def test_init_script_unchanged_without_pre_init_args(self):
+        """
+        Classes without __attrs_pre_init__ -- or with one that only takes
+        self -- generate the same __init__ as before: factories are
+        resolved in the field setters, not before a pre-init call.
+        """
+
+        @attr.s
+        class C:
+            x = attr.ib()
+            y = attr.ib(default=3)
+            z = attr.ib(factory=list, kw_only=True)
+
+        no_pre_init, _, _ = _attrs_to_init_script(
+            C.__attrs_attrs__,
+            is_frozen=False,
+            is_slotted=True,
+            call_pre_init=False,
+            pre_init_has_args=False,
+            call_post_init=False,
+            does_cache_hash=False,
+            base_attr_map={},
+            is_exc=False,
+            needs_cached_setattr=False,
+            has_cls_on_setattr=False,
+            method_name="__init__",
+        )
+        pre_init_no_args, _, _ = _attrs_to_init_script(
+            C.__attrs_attrs__,
+            is_frozen=False,
+            is_slotted=True,
+            call_pre_init=True,
+            pre_init_has_args=False,
+            call_post_init=False,
+            does_cache_hash=False,
+            base_attr_map={},
+            is_exc=False,
+            needs_cached_setattr=False,
+            has_cls_on_setattr=False,
+            method_name="__init__",
+        )
+
+        assert (
+            "def __init__(self, x, y=attr_dict['y'].default, *, z=NOTHING):\n"
+            "    self.x = x\n"
+            "    self.y = y\n"
+            "    if z is not NOTHING:\n"
+            "        self.z = z\n"
+            "    else:\n"
+            "        self.z = __attr_factory_z()\n"
+        ) == no_pre_init
+        assert (
+            "def __init__(self, x, y=attr_dict['y'].default, *, z=NOTHING):\n"
+            "    self.__attrs_pre_init__()\n"
+            "    self.x = x\n"
+            "    self.y = y\n"
+            "    if z is not NOTHING:\n"
+            "        self.z = z\n"
+            "    else:\n"
+            "        self.z = __attr_factory_z()\n"
+        ) == pre_init_no_args
 
     @pytest.mark.usefixtures("with_and_without_validation")
     def test_post_init(self):
